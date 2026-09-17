@@ -1555,6 +1555,7 @@ async function recoverDel() {
    ========================================================= */
 function transcribeRequest(o, onUpload) {
   const xhr = new XMLHttpRequest();
+  let uploaded = false;
   const promise = new Promise((res, rej) => {
     const fd = new FormData();
     fd.append('model_id', 'scribe_v2');
@@ -1565,20 +1566,118 @@ function transcribeRequest(o, onUpload) {
     fd.append('tag_audio_events', 'false');
     if (o.clean) fd.append('no_verbatim', 'true');
     for (const t of o.terms || []) fd.append('keyterms', t);
+    // In modalità asincrona ElevenLabs risponde subito con un identificativo e il risultato si
+    // recupera a parte (pollTranscript): la connessione non resta aperta per tutta l'elaborazione.
+    if (o.async) fd.append('webhook', 'true');
     xhr.open('POST', `${API}/speech-to-text`);
     xhr.setRequestHeader('xi-api-key', S.apiKey);
     xhr.upload.onprogress = e => { if (e.lengthComputable) onUpload(e.loaded / e.total, false); };
-    xhr.upload.onload = () => onUpload(1, true);
+    xhr.upload.onload = () => { uploaded = true; onUpload(1, true); };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         try { res(JSON.parse(xhr.responseText)); } catch { rej(new Error('ElevenLabs ha restituito una risposta non leggibile. Riprova.')); }
       } else rej(apiError(xhr.status, xhr.responseText));
     };
-    xhr.onerror = () => rej(new Error('Connessione a ElevenLabs non riuscita. Controlla la rete e riprova.'));
+    // Stato 0: la richiesta non è partita oppure la risposta è andata persa (anche una pagina d'errore
+    // del CDN senza intestazioni CORS arriva qui). Il browser non distingue i casi: lo fa l'avanzamento.
+    xhr.onerror = () => rej(new Error(uploaded
+      ? 'La connessione con ElevenLabs si è interrotta dopo l\'invio dell\'audio. Riprova tra qualche istante.'
+      : 'Impossibile raggiungere ElevenLabs. Verifica la chiave dalle Impostazioni: se anche la verifica fallisce, la rete o un\'estensione del browser stanno bloccando api.elevenlabs.io.'));
     xhr.onabort = () => rej(Object.assign(new Error('Trascrizione annullata.'), { aborted: true }));
     xhr.send(fd);
   });
   return { promise, abort: () => xhr.abort() };
+}
+
+/* Legge una trascrizione già avviata: ElevenLabs risponde 404 finché non ha finito. */
+async function fetchTranscript(id, signal) {
+  const r = await fetch(`${API}/speech-to-text/transcripts/${encodeURIComponent(id)}`, { headers: { 'xi-api-key': S.apiKey }, signal });
+  return { status: r.status, body: await r.text() };
+}
+
+/* Attende che la trascrizione `id` sia disponibile, per al massimo `maxSec` secondi.
+   Risolve con il risultato, con null se il tempo è scaduto; rifiuta su errore definitivo o annullamento. */
+function pollTranscript(id, job, maxSec) {
+  return new Promise((res, rej) => {
+    const ctrl = new AbortController();
+    const t0 = Date.now();
+    let timer = null, wait = 4000;
+    job.abort = () => { clearTimeout(timer); ctrl.abort(); rej(Object.assign(new Error('Trascrizione annullata.'), { aborted: true })); };
+    const tick = async () => {
+      let r;
+      try { r = await fetchTranscript(id, ctrl.signal); } catch { r = { status: 0, body: '' }; }
+      if (ctrl.signal.aborted) return;
+      if (r.status >= 200 && r.status < 300) {
+        let j = null;
+        try { j = JSON.parse(r.body); } catch {}
+        if (j && (Array.isArray(j.words) || typeof j.text === 'string')) return res(j);
+      } else if (r.status === 401 || r.status === 403 || r.status === 422) return rej(apiError(r.status, r.body));
+      // 404 = non ancora pronta; 0 o 5xx = problema temporaneo: si riprova
+      if (Date.now() - t0 > maxSec * 1000) return res(null);
+      timer = setTimeout(tick, wait);
+      wait = Math.min(15000, Math.round(wait * 1.5));
+    };
+    tick();
+  });
+}
+
+/* Trascrizione completa di una lezione: recupero di un risultato già avviato, poi invio asincrono
+   con attesa del risultato, e solo se ElevenLabs lo rifiuta l'invio classico con risposta unica. */
+async function transcribe(lesson, blob, job) {
+  const paint = () => { if (state.view === 'progress') renderProgress(); };
+  const onUpload = (f, done) => {
+    job.up = f;
+    if (done && job.phase === 2) { job.phase = 3; job.t0 = Date.now(); }
+    paint();
+  };
+  const uploading = () => { job.phase = 2; job.up = 0; paint(); };
+  const waiting = () => { job.phase = 3; job.t0 = Date.now(); paint(); };
+  const send = async (async) => {
+    const req = transcribeRequest({
+      blob, filename: lesson.audio && lesson.audio.name || 'lezione.webm', async,
+      lang: lesson.options.lang, clean: lesson.options.clean, terms: lesson.options.terms,
+    }, onUpload);
+    job.abort = req.abort;
+    try { return await req.promise; } finally { job.abort = null; }
+  };
+
+  // Un tentativo precedente è stato interrotto dopo l'avvio: il risultato potrebbe essere già pronto
+  const started = !!lesson.transcriptionId;
+  if (started) {
+    waiting();
+    const json = await pollTranscript(lesson.transcriptionId, job, 45);
+    if (json) return json;
+    lesson.transcriptionId = null;
+    uploading();
+  }
+  if (!blob) {
+    const rec = await DB.get('audio', lesson.id).catch(() => null);
+    blob = rec && rec.blob;
+    if (!blob) throw new Error('L\'audio di questa lezione non è più disponibile: non è possibile inviarlo di nuovo.');
+  }
+
+  // Modalità asincrona: la risposta arriva appena l'audio è caricato, così una connessione che cade
+  // durante l'elaborazione (lezioni lunghe, telefono bloccato, scheda in secondo piano) non fa perdere nulla.
+  // Se un tentativo asincrono per questa lezione è già andato a vuoto si passa direttamente all'invio classico.
+  if (!started) {
+    let json = null;
+    try { json = await send(true); }
+    catch (e) {
+      // Un rifiuto della modalità asincrona (4xx) non è un errore del file: si ripiega sull'invio classico
+      if (e.aborted || !(e.status === 400 || e.status === 403 || e.status === 422)) throw e;
+    }
+    if (json && Array.isArray(json.words)) return json;
+    if (json && json.transcription_id) {
+      lesson.transcriptionId = json.transcription_id;
+      await saveLesson(lesson).catch(() => {});
+      if (job.phase !== 3) waiting();   // l'audio è arrivato anche se il browser non ha segnalato la fine del caricamento
+      const r = await pollTranscript(lesson.transcriptionId, job, Math.max(8 * 60, (lesson.duration || 0) / 8 + 4 * 60));
+      if (r) return r;
+      throw new Error('ElevenLabs sta ancora elaborando l\'audio. Riprova tra qualche minuto dall\'archivio: il risultato verrà recuperato senza inviarlo di nuovo.');
+    }
+    uploading();
+  }
+  return send(false);
 }
 
 function apiError(status, body) {
@@ -1601,7 +1700,7 @@ function apiError(status, body) {
   else if (status === 400 || status === 422) msg = 'ElevenLabs non ha accettato il file' + (detail ? `: ${detail}` : '. Verifica che sia un audio valido.');
   else if (status >= 500) msg = 'ElevenLabs ha un problema temporaneo. Riprova tra poco.';
   else msg = `Errore ${status || 'di rete'}` + (detail ? `: ${detail}` : '');
-  return Object.assign(new Error(msg), { status });
+  return Object.assign(new Error(msg), { status, detail: all.trim() });
 }
 
 function compactWords(json) {
@@ -1660,16 +1759,27 @@ async function retryLesson(id) {
   if (state.job) { toast('C\'è già una trascrizione in corso: attendi che finisca.', { icon: 'clock' }); return; }
   if (!S.apiKey) { openSettings(); return; }
   const rec = await DB.get('audio', id).catch(() => null);
-  if (!rec || !rec.blob) { toast('L\'audio di questa lezione non è più disponibile.', { icon: 'alert' }); return; }
-  runJob(l, rec.blob, {});
+  const blob = rec && rec.blob || null;
+  if (!blob && !l.transcriptionId) { toast('L\'audio di questa lezione non è più disponibile.', { icon: 'alert' }); return; }
+  runJob(l, blob, {});
+}
+
+/* Tiene lo schermo acceso durante l'invio: con lo schermo spento il telefono sospende la pagina e la richiesta cade. */
+async function jobWake(job) {
+  if (!('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+  try {
+    const lock = await navigator.wakeLock.request('screen');
+    if (state.job === job) job.wake = lock; else lock.release().catch(() => {});
+  } catch {}
 }
 
 async function runJob(lesson, blob, o) {
-  const job = state.job = { lessonId: lesson.id, phase: 1, up: 0, t0: 0, abort: null, error: null };
+  const job = state.job = { lessonId: lesson.id, phase: 1, up: 0, t0: 0, abort: null, error: null, wake: null };
   lesson.status = 'processing';
   lesson.error = null;
-  show('progress');
+  if (o.resume) renderLibrary(); else show('progress');
   renderProgress();
+  jobWake(job);
   try {
     if (o.fresh) {
       try {
@@ -1685,23 +1795,14 @@ async function runJob(lesson, blob, o) {
 
     job.phase = 2;
     renderProgress();
-    const req = transcribeRequest({
-      blob, filename: lesson.audio && lesson.audio.name || 'lezione.webm',
-      lang: lesson.options.lang, clean: lesson.options.clean, terms: lesson.options.terms,
-    }, (f, done) => {
-      job.up = f;
-      if (done && job.phase === 2) { job.phase = 3; job.t0 = Date.now(); }
-      if (state.view === 'progress') renderProgress();
-    });
-    job.abort = req.abort;
-    const json = await req.promise;
+    const json = await transcribe(lesson, blob, job);
 
     job.phase = 4;
     renderProgress();
     lesson.words = compactWords(json);
     lesson.duration = json.audio_duration_secs || lesson.duration || (lesson.words.length ? lesson.words[lesson.words.length - 1].e : 0);
     lesson.language = json.language_code || lesson.options.lang;
-    lesson.transcriptionId = json.transcription_id || null;
+    lesson.transcriptionId = json.transcription_id || lesson.transcriptionId || null;
     lesson.speakers = {};
     lesson.edits = {};
     lesson.status = 'done';
@@ -1723,6 +1824,9 @@ async function runJob(lesson, blob, o) {
     else if (state.view === 'progress') openLesson(lesson.id);
     else if (!e.aborted) toast('Trascrizione non riuscita: ' + lesson.error, { icon: 'alert', action: 'Dettagli', onAction: () => openLesson(lesson.id), ms: 10000 });
     renderLibrary();
+  } finally {
+    try { job.wake && job.wake.release(); } catch {}
+    job.wake = null;
   }
 }
 
@@ -1756,7 +1860,7 @@ function renderProgressError(l, job) {
   $('#pgErr').textContent = l.error;
   $('#pgErr').hidden = false;
   $('#pgCancel').hidden = true;
-  $('#pgRetry').hidden = !l.hasAudio;
+  $('#pgRetry').hidden = !(l.hasAudio || l.transcriptionId);
   $('#pgRetry').dataset.id = l.id;
   $('#pgHide').textContent = 'Chiudi';
 }
@@ -2115,10 +2219,12 @@ function renderMeta(l, m) {
 
 function renderRetry(l) {
   $('#rtTitle').textContent = 'Trascrizione non completata';
-  $('#rtDesc').textContent = l.hasAudio ? 'L\'audio è salvato su questo computer: puoi riprovare quando vuoi.' : 'L\'audio di questa lezione non è più disponibile.';
+  $('#rtDesc').textContent = l.hasAudio ? 'L\'audio è salvato su questo computer: puoi riprovare quando vuoi.'
+    : l.transcriptionId ? 'L\'audio non è più salvato, ma la trascrizione avviata su ElevenLabs può ancora essere recuperata.'
+    : 'L\'audio di questa lezione non è più disponibile.';
   $('#rtErr').textContent = l.error || '';
   $('#rtErr').hidden = !l.error;
-  $('#rtRetry').hidden = !l.hasAudio;
+  $('#rtRetry').hidden = !(l.hasAudio || l.transcriptionId);
 }
 
 function renderDoc() {
@@ -2727,7 +2833,7 @@ async function testKey() {
       st.innerHTML = `<span class="kstate bad">${icon('alert')}Risposta inattesa da ElevenLabs (${r.status})</span>`;
     }
   } catch {
-    st.innerHTML = `<span class="kstate bad">${icon('alert')}Impossibile contattare ElevenLabs: controlla la connessione</span>`;
+    st.innerHTML = `<span class="kstate bad">${icon('alert')}Impossibile contattare ElevenLabs: la rete o un'estensione del browser potrebbero bloccare api.elevenlabs.io</span>`;
   }
 }
 
@@ -2842,6 +2948,7 @@ function bind() {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { commitAllParas(); flushSaves(); }
     if (document.visibilityState === 'visible' && Rec.state !== 'idle' && (!Rec.wake || Rec.wake.released)) acquireWake();
+    if (document.visibilityState === 'visible' && state.job && (!state.job.wake || state.job.wake.released)) jobWake(state.job);
   });
   window.addEventListener('beforeunload', e => {
     if (Rec.state !== 'idle' || state.job) { e.preventDefault(); e.returnValue = ''; }
@@ -3038,16 +3145,22 @@ async function init() {
     toast('Archivio non disponibile in questo browser: le lezioni resteranno solo fino alla chiusura.', { icon: 'alert', ms: 8000 });
   }
   state.lessons = (await DB.all('lessons').catch(() => [])) || [];
+  let resume = null;
   for (const l of state.lessons) {
-    if (l.status === 'processing') {
-      l.status = l.words ? 'done' : 'error';
-      l.error = 'La trascrizione è stata interrotta perché la finestra è stata chiusa o ricaricata.';
-      DB.put('lessons', l).catch(() => {});
-    }
+    if (l.status !== 'processing') continue;
+    // Se ElevenLabs aveva già preso in carico l'audio, il risultato si recupera senza inviarlo di nuovo
+    if (!l.words && l.transcriptionId && S.apiKey && !resume) { resume = l; continue; }
+    l.status = l.words ? 'done' : 'error';
+    l.error = 'La trascrizione è stata interrotta perché la finestra è stata chiusa o ricaricata.';
+    DB.put('lessons', l).catch(() => {});
   }
   await applyRetention();
   updateCourses();
   show('home');
+  if (resume) {
+    toast(`Riprendo la trascrizione di “${resume.title}”`, { icon: 'clock', ms: 5000 });
+    runJob(resume, null, { resume: true });
+  }
 }
 
 init();
