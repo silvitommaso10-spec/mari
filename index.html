@@ -890,7 +890,7 @@ const LS = {
   set(k, v) { try { localStorage.setItem('mari.' + k, JSON.stringify(v)); } catch {} },
   del(k) { try { localStorage.removeItem('mari.' + k); } catch {} },
 };
-const DEFAULTS = { apiKey: '', plan: 'creator', lang: 'it', clean: true, theme: 'auto', showTs: true, showUnc: false, retention: 0, follow: true, rate: 1 };
+const DEFAULTS = { apiKey: '', plan: 'creator', lang: 'it', clean: true, theme: 'auto', showTs: true, showUnc: false, retention: 0, follow: true, rate: 1, asyncStt: true };
 const S = Object.assign({}, DEFAULTS, LS.get('settings', {}));
 const saveSettings = () => LS.set('settings', S);
 
@@ -1571,6 +1571,10 @@ function transcribeRequest(o, onUpload) {
     if (o.async) fd.append('webhook', 'true');
     xhr.open('POST', `${API}/speech-to-text`);
     xhr.setRequestHeader('xi-api-key', S.apiKey);
+    // Senza un tempo massimo esplicito Safari (iPhone, iPad, Mac) chiude la richiesta dopo 60 secondi
+    // senza risposta, mentre l'elaborazione di una lezione lunga dura ben di più. Qui si concede
+    // tutto il tempo che serve: l'utente può sempre annullare.
+    xhr.timeout = 2 * 60 * 60 * 1000;
     xhr.upload.onprogress = e => { if (e.lengthComputable) onUpload(e.loaded / e.total, false); };
     xhr.upload.onload = () => { uploaded = true; onUpload(1, true); };
     xhr.onload = () => {
@@ -1583,6 +1587,7 @@ function transcribeRequest(o, onUpload) {
     xhr.onerror = () => rej(new Error(uploaded
       ? 'La connessione con ElevenLabs si è interrotta dopo l\'invio dell\'audio. Riprova tra qualche istante.'
       : 'Impossibile raggiungere ElevenLabs. Verifica la chiave dalle Impostazioni: se anche la verifica fallisce, la rete o un\'estensione del browser stanno bloccando api.elevenlabs.io.'));
+    xhr.ontimeout = () => rej(new Error('ElevenLabs non ha risposto entro il tempo massimo. Riprova tra qualche minuto.'));
     xhr.onabort = () => rej(Object.assign(new Error('Trascrizione annullata.'), { aborted: true }));
     xhr.send(fd);
   });
@@ -1658,13 +1663,15 @@ async function transcribe(lesson, blob, job) {
 
   // Modalità asincrona: la risposta arriva appena l'audio è caricato, così una connessione che cade
   // durante l'elaborazione (lezioni lunghe, telefono bloccato, scheda in secondo piano) non fa perdere nulla.
-  // Se un tentativo asincrono per questa lezione è già andato a vuoto si passa direttamente all'invio classico.
-  if (!started) {
+  // Se un tentativo asincrono per questa lezione è già andato a vuoto, o se per questo account la modalità
+  // si è rivelata inutilizzabile, si passa direttamente all'invio classico con risposta unica.
+  if (!started && S.asyncStt) {
     let json = null;
     try { json = await send(true); }
     catch (e) {
       // Un rifiuto della modalità asincrona (4xx) non è un errore del file: si ripiega sull'invio classico
       if (e.aborted || !(e.status === 400 || e.status === 403 || e.status === 422)) throw e;
+      if (/webhook/i.test(e.detail || '')) { S.asyncStt = false; saveSettings(); }
     }
     if (json && Array.isArray(json.words)) return json;
     if (json && json.transcription_id) {
@@ -1673,6 +1680,8 @@ async function transcribe(lesson, blob, job) {
       if (job.phase !== 3) waiting();   // l'audio è arrivato anche se il browser non ha segnalato la fine del caricamento
       const r = await pollTranscript(lesson.transcriptionId, job, Math.max(8 * 60, (lesson.duration || 0) / 8 + 4 * 60));
       if (r) return r;
+      // Il risultato non è mai comparso: per le prossime lezioni si usa direttamente l'invio classico
+      S.asyncStt = false; saveSettings();
       throw new Error('ElevenLabs sta ancora elaborando l\'audio. Riprova tra qualche minuto dall\'archivio: il risultato verrà recuperato senza inviarlo di nuovo.');
     }
     uploading();
@@ -1835,7 +1844,7 @@ function renderProgress() {
   const l = job && lessonById(job.lessonId);
   if (!job || !l) return;
   $('#pgTitle').textContent = job.phase === 4 ? 'Quasi pronto…' : 'Trascrizione in corso';
-  $('#pgDesc').textContent = `${l.title} · ${fmtDur(l.duration)}` + (job.phase === 3 ? ' · Per le lezioni lunghe può servire qualche minuto.' : '');
+  $('#pgDesc').textContent = `${l.title} · ${fmtDur(l.duration)}` + (job.phase === 3 ? ' · Per le lezioni lunghe può servire qualche minuto: lascia Mari aperta in primo piano.' : '');
   $('#pgLoader').classList.remove('done');
   $('#pgErr').hidden = true;
   $('#pgRetry').hidden = true;
