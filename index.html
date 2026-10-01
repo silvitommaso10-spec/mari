@@ -843,7 +843,7 @@ dialog[open]{animation:dlgIn .28s var(--ease)}
   <form method="dialog" class="dlg confirm">
     <div class="dlg-h"><h2 id="cfT">Sei sicuro?</h2></div>
     <div class="dlg-b"><p id="cfM"></p></div>
-    <div class="dlg-f"><button class="btn btn-ghost" value="no">Annulla</button><button class="btn btn-primary" value="yes" id="cfOk">Conferma</button></div>
+    <div class="dlg-f"><button class="btn btn-ghost" value="no" id="cfNo">Annulla</button><button class="btn btn-primary" value="yes" id="cfOk">Conferma</button></div>
   </form>
 </dialog>
 
@@ -1014,10 +1014,11 @@ function toast(msg, o = {}) {
   setTimeout(close, o.ms || 3400);
 }
 
-function confirmDlg(title, msg, okText = 'Conferma', danger = false) {
+function confirmDlg(title, msg, okText = 'Conferma', danger = false, noText = 'Annulla') {
   const d = $('#dlgConfirm');
   $('#cfT').textContent = title;
   $('#cfM').textContent = msg;
+  $('#cfNo').textContent = noText;
   const ok = $('#cfOk');
   ok.textContent = okText;
   ok.classList.toggle('btn-danger-fill', danger);
@@ -1738,11 +1739,30 @@ function compactWords(json) {
   return out;
 }
 
-function startJob() {
+/* Prima di ogni trascrizione: tre domande, e si va avanti solo con tre sì.
+   Restituisce true se si può procedere; altrimenti mostra l'errore e restituisce false. */
+async function affectionCheck() {
+  const questions = [
+    ['Vuoi bene a Tommaso?', 'Rispondi con sincerità prima di continuare.'],
+    ['Ti piace Tommaso?', 'Anche qui serve un sì.'],
+    ['Sicura sicura?', 'Ultima domanda, poi parte la trascrizione.'],
+  ];
+  for (const [title, msg] of questions) {
+    if (!(await confirmDlg(title, msg, 'Sì', false, 'No'))) {
+      toast('Impossibile fare la trascrizione per mancanza di affetto.', { icon: 'alert', ms: 6000 });
+      return false;
+    }
+  }
+  return true;
+}
+
+async function startJob() {
   const p = state.pending;
   if (!p) return;
   if (!S.apiKey) { openSettings(); toast('Inserisci prima la chiave API di ElevenLabs.', { icon: 'key' }); return; }
   if (state.job) { toast('C\'è già una trascrizione in corso: attendi che finisca.', { icon: 'clock' }); return; }
+  if (!(await affectionCheck())) return;
+  if (state.pending !== p || state.job) return;
   stopPreview();
   const course = $('#suCourse').value.trim();
   const terms = parseTerms($('#suTerms').value);
@@ -1767,6 +1787,8 @@ async function retryLesson(id) {
   if (!l) return;
   if (state.job) { toast('C\'è già una trascrizione in corso: attendi che finisca.', { icon: 'clock' }); return; }
   if (!S.apiKey) { openSettings(); return; }
+  if (!(await affectionCheck())) return;
+  if (state.job) return;
   const rec = await DB.get('audio', id).catch(() => null);
   const blob = rec && rec.blob || null;
   if (!blob && !l.transcriptionId) { toast('L\'audio di questa lezione non è più disponibile.', { icon: 'alert' }); return; }
